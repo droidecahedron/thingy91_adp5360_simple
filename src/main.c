@@ -9,16 +9,42 @@
 #include <zephyr/sys/printk.h>
 #include <zephyr/logging/log.h>
 
+#include <zephyr/drivers/i2c.h>
+#include <zephyr/sys/util.h>
+
 #if defined(CONFIG_ADP536X)
 #include <adp536x.h>
 #endif
 
 #define DEBUG_USE_SYSINIT false // Set to true if you want to use sys_init the way the atv2/thingy board inits do.
 
-LOG_MODULE_REGISTER(thingy91_adp5360_main, LOG_LEVEL_ERR);
 #define ADP536X_I2C_DEVICE DEVICE_DT_GET(DT_NODELABEL(i2c2))
 
 static bool g_started_up = false; // don't feel like using any sync primitives.
+
+LOG_MODULE_REGISTER(thingy91_adp5360_main, LOG_LEVEL_ERR);
+
+// Battery Sampling: timer will fire a battery charge request work queue item every time it finishes.
+//! WorkQ
+static struct k_work battery_soc_sample_work;
+static void battery_soc_sample_work_fn(struct k_work *work)
+{
+	uint8_t battery_percentage_timer;
+	adp536x_fg_soc(&battery_percentage_timer);
+	printk("Batt percentage as uint8 : %d\n", battery_percentage_timer);
+}
+
+//! Timer
+#define BATTERY_SAMPLE_INTERVAL_MS 5000
+
+static void battery_sample_timer_handler(struct k_timer *timer);
+K_TIMER_DEFINE(battery_sample_timer, battery_sample_timer_handler, NULL);
+
+void battery_sample_timer_handler(struct k_timer *timer)
+{
+	k_work_init(&battery_soc_sample_work, battery_soc_sample_work_fn);
+	k_work_submit(&battery_soc_sample_work);
+}
 
 // pmic init
 static int power_mgmt_init(void)
@@ -91,17 +117,15 @@ static int thingy91_board_init(void)
 int main(void)
 {
 
-	uint8_t battery_percentage;
-	while(!g_started_up) // wait for g_started_up to go true, either by sys init or the startup thread.
+	while (!g_started_up) // wait for g_started_up to go true, either by sys init or the startup thread.
 	{
 		k_yield();
-	} 
+	}
+	k_timer_start(&battery_sample_timer, K_MSEC(1000), K_MSEC(BATTERY_SAMPLE_INTERVAL_MS));
 
 	printk("Hello World! %s, battery percentage portions stripped out of atv2\n", CONFIG_BOARD);
 	while (1)
 	{
-		adp536x_fg_soc(&battery_percentage);
-		printk("Batt percentage as uint8 : %d\n", battery_percentage);
 		k_msleep(5000);
 	}
 }
@@ -109,19 +133,24 @@ int main(void)
 int startup_thread(void)
 {
 	printk("STARTUP Thread: Not using SYS_INIT for pmic inits\n");
-	#if(!DEBUG_USE_SYSINIT)
-		if(thingy91_board_init() != 0)
+#if (!DEBUG_USE_SYSINIT)
+	if (thingy91_board_init() != 0)
 		printk("Could not initialize PMIC\n");
-		return 0;
-	#endif
+
+	LOG_INF("STARTUP thread starting Software timer to sample battery");
+	uint8_t battery_percentage_startup;
+	adp536x_fg_soc(&battery_percentage_startup); // quick read when starting up
+	printk("Batt percentage on startup: %d\n", battery_percentage_startup);
+	return 0;
+#endif
 }
 
 // You can uncomment this if you want. I think it's odd to do this way.
-#if(DEBUG_USE_SYSINIT)
+#if (DEBUG_USE_SYSINIT)
 SYS_INIT(thingy91_board_init, POST_KERNEL, CONFIG_BOARD_INIT_PRIORITY);
 #else
 #define STACKSIZE 1024
 #define STARTUP_THREAD_PRIORITY -1
 K_THREAD_DEFINE(startup_thread_id, STACKSIZE, startup_thread, NULL, NULL, NULL,
-		STARTUP_THREAD_PRIORITY, 0, 0);
+				STARTUP_THREAD_PRIORITY, 0, 0);
 #endif
